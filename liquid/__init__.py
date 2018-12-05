@@ -1,11 +1,12 @@
 VERSION = '0.0.4'
 
-import re, traceback, logging
+import re, traceback, logging, shlex
+import os.path
 from .builder import LiquidLine, LiquidCode
 from .exception import LiquidSyntaxError, LiquidRenderError
 from .filters import filters
 
-class Liquid(object): 
+class Liquid(object):
 
 	"""
 	Implement liquid
@@ -51,13 +52,17 @@ class Liquid(object):
 	TOKEN_ENDCAPTURE      = 'endcapture'
 	TOKEN_WHILE           = 'while'
 	TOKEN_ENDWHILE        = 'endwhile'
+	TOKEN_PAGINATE        = 'paginate'
+	TOKEN_ENDPAGINATE     = 'endpaginate'
+	TOKEN_INCLUDE         = 'include'
+
 
 	DEBUG = False
 	MODE  = 'loose'
 
-	def __init__(self, text, **envs):
+	def __init__(self, text, include_path=None, **envs):
 		"""
-		Construct a Templite with the given `text`.
+		Construct a Template with the given `text`.
 		`context` is a dictionary for future renderings.
 		@params:
 			`text`     : The template text
@@ -72,8 +77,10 @@ class Liquid(object):
 		self.logger.addHandler(handler)
 		#self.logger.setLevel(Liquid.LOGLEVEL)
 
+		self.include_path = include_path
 		self.envs  = {
 			Liquid.COMPLIED_FILTERS: filters,
+			'blank'                : None,
 			'true'                 : True,
 			'false'                : False,
 			'nil'                  : None
@@ -85,7 +92,7 @@ class Liquid(object):
 
 		lines2    = self.text.split('\n', 1)
 		modematch = re.match(r'^\s*{%\s*mode\s+(.+)%}\s*$', lines2[0])
-		
+
 		mode  = Liquid.MODE
 		self.debug = Liquid.DEBUG
 		if modematch:
@@ -95,7 +102,7 @@ class Liquid(object):
 			if 'loose' in mm:     mode = 'loose'
 			elif 'mixed' in mm:   mode = 'mixed'
 			elif 'compact' in mm: mode = 'compact'
-		
+
 		self.logger.setLevel(logging.DEBUG if self.debug else logging.CRITICAL)
 		self.logger.debug('Mode: {} {}'.format(mode, 'debug' if self.debug else ''))
 
@@ -128,7 +135,7 @@ class Liquid(object):
 				continue
 			tokentype, neattoken = Liquid._tokenType(token, lineno, opsStack)
 			self.logger.debug('Token type: {!r}, content: {!r} at line {}: {!r}'.format(tokentype, neattoken, lineno, token))
-			if not opsStack or opsStack[-1][0] not in [Liquid.TOKEN_RAW, Liquid.TOKEN_COMMENT]:
+			if not opsStack or opsStack[-1][0] not in [Liquid.TOKEN_RAW, Liquid.TOKEN_COMMENT, Liquid.TOKEN_PAGINATE]:
 				if tokentype in [Liquid.TOKEN_IF, Liquid.TOKEN_FOR, Liquid.TOKEN_WHILE]:
 					self._flush(capname = Liquid._capname(opsStack))
 					self._parsePythonLiteral(tokentype, neattoken, lineno = lineno, src = token, indent = True)
@@ -151,7 +158,7 @@ class Liquid(object):
 						raise LiquidSyntaxError('"{}" must be in an if/unless/case block'.format(tokentype), lineno, token)
 					self._flush(capname = Liquid._capname(opsStack))
 					self._parsePythonLiteral(tokentype, neattoken, lineno = lineno, src = token, indent = True, dedent = True)
-				elif tokentype == Liquid.TOKEN_COMMENTTAG:
+				elif tokentype in [Liquid.TOKEN_COMMENTTAG, Liquid.TOKEN_PAGINATE, Liquid.TOKEN_ENDPAGINATE]:
 					self._flush(capname = Liquid._capname(opsStack))
 				elif tokentype == Liquid.TOKEN_CAPTURE:
 					self._flush(capname = Liquid._capname(opsStack))
@@ -186,13 +193,16 @@ class Liquid(object):
 				elif tokentype == Liquid.TOKEN_DECREMENT:
 					self._flush(capname = Liquid._capname(opsStack))
 					self._parseDecrement(neattoken, lineno = lineno, src = token)
+				elif tokentype == Liquid.TOKEN_INCLUDE:
+					self._flush(capname=Liquid._capname(opsStack))
+					self._parseInclude(neattoken, lineno = lineno, src = token)
 				elif tokentype == Liquid.TOKEN_UNLESS:
 					self._flush(capname = Liquid._capname(opsStack))
 					self._parseUnless(neattoken, lineno = lineno, src = token)
 					opsStack.append((tokentype, neattoken))
 				elif tokentype in [
-					Liquid.TOKEN_ENDIF, Liquid.TOKEN_ENDFOR, Liquid.TOKEN_ENDWHILE, 
-					Liquid.TOKEN_ENDUNLESS, Liquid.TOKEN_ENDCASE, Liquid.TOKEN_IF, 
+					Liquid.TOKEN_ENDIF, Liquid.TOKEN_ENDFOR, Liquid.TOKEN_ENDWHILE,
+					Liquid.TOKEN_ENDUNLESS, Liquid.TOKEN_ENDCASE, Liquid.TOKEN_IF,
 					Liquid.TOKEN_FOR, Liquid.TOKEN_WHILE]:
 					if not opsStack or opsStack[-1][0] != tokentype[3:]:
 						raise LiquidSyntaxError('Unmatched tag: {}/{}'.format(opsStack[-1][0] if opsStack else '', tokentype), lineno, token)
@@ -204,7 +214,7 @@ class Liquid(object):
 					opsStack.append((tokentype, neattoken))
 				else:
 					self._parseLiteral(token, capture = Liquid._capname(opsStack))
-				
+
 			else: # raw/comment started
 				if opsStack[-1][0] == Liquid.TOKEN_COMMENT and tokentype == Liquid.TOKEN_ENDCOMMENT:
 					self._flush(capname = Liquid._capname(opsStack))
@@ -222,7 +232,7 @@ class Liquid(object):
 
 		if opsStack:
 			raise LiquidSyntaxError(msg = 'Unclosed template tag: {}'.format(opsStack[-1][0]))
-		
+
 		self._flush()
 
 		self.code.addLine("{} = ''.join(str(x) for x in {})".format(Liquid.COMPLIED_RENDERED_STR, Liquid.COMPLIED_RENDERED))
@@ -288,9 +298,14 @@ class Liquid(object):
 		else:
 			# builtin, or passed functions
 			if ':' not in filterstr:
+				if filterstr in filters:
+					return '{}[{!r}]({})'.format(Liquid.COMPLIED_FILTERS, filterstr, valstr)
+
 				return '{}({})'.format(filterstr, valstr)
-			
+
 			func, arg = filterstr.split(':', 1)
+			if func in filters:
+				return '{}[{!r}]({}, {})'.format(Liquid.COMPLIED_FILTERS, func, valstr, arg)
 			return '{}({}, {})'.format(func, valstr, arg)
 
 	@staticmethod
@@ -377,7 +392,7 @@ class Liquid(object):
 			return Liquid.TOKEN_LITERAL, ''
 		if Liquid.TOKEN_COMMENT in ops and (tag2[1] != '%' or neattoken != Liquid.TOKEN_ENDCOMMENT):
 			return Liquid.TOKEN_LITERAL, ''
-		
+
 		if istag:
 			if tag2[1] == '#':
 				return Liquid.TOKEN_COMMENTTAG, ''
@@ -397,7 +412,7 @@ class Liquid(object):
 						raise LiquidSyntaxError('No statements for "{}"'.format(words[0]), lineno, token)
 					if words[0] == 'elsif' or words[0] == 'elseif':
 						words[0] = 'elif'
-					return getattr(Liquid, 'TOKEN_' + words[0].upper()), words[1] 
+					return getattr(Liquid, 'TOKEN_' + words[0].upper()), words[1]
 				elif words[0] == 'assign':
 					if len(words) == 1:
 						raise LiquidSyntaxError('No statements for "{}"'.format(words[0]), lineno, token)
@@ -418,6 +433,8 @@ class Liquid(object):
 					if len(words) == 1:
 						raise LiquidSyntaxError('No variable for {}'.format(words[0]), lineno, token)
 					return getattr(Liquid, 'TOKEN_' + words[0].upper()), words[1]
+				elif words[0] == 'include':
+					return Liquid.TOKEN_INCLUDE, words[1]
 				elif words[0].startswith('end'):
 					if len(words) > 1:
 						raise LiquidSyntaxError('Additional statements for {}'.format(words[0]), lineno, token)
@@ -433,14 +450,37 @@ class Liquid(object):
 		self.logger.debug(' - parsing expression: {}'.format(token))
 		container = self.captured if capture else self.buffered
 		container.append(Liquid._exprCode(token, lineno, src))
-	
+
+	def _parseContainsExpr(self, neattoken):
+		words = shlex.split(neattoken, posix=False)
+		# list contains "poop" -> "poop" in list
+		for idx, val in enumerate(words):
+			if val == 'contains':
+				words[idx] = 'in'
+				t = words[idx-1]
+				words[idx-1] = words[idx+1]
+				words[idx+1] = t
+
+		return ' '.join(words)
+
 	def _parsePythonLiteral(self, token, neattoken = '', lineno = 0, src = None, colon = True, indent = False, dedent = False):
 		self.logger.debug(' - parsing python literal: {} {}'.format(token, neattoken))
 		if dedent:
 			self.code.dedent()
 		src = src or token
+		if token == 'if':
+			if 'contains' in neattoken:
+				neattoken = self._parseContainsExpr(neattoken)
+			else:
+				for x in filters.keys():
+					if '{}: '.format(x) in neattoken and '|' in neattoken:
+						regex = re.compile(r"((\S+)\s+\|\s+(\S+):\s+(\S+)).*?")
+						expression_parts = regex.findall(neattoken)
+						filter_expression = self._exprFilter('{}, {}'.format(expression_parts[0][1], expression_parts[0][3]), x, lineno, src)
+						neattoken = neattoken.replace(expression_parts[0][0], filter_expression)
+						break
 		line = LiquidLine('{}{}{}'.format(
-			token, 
+			token,
 			' ' + neattoken if neattoken else ''
 			, ':' if colon else ''), lineno = lineno, src = src)
 		self.code.addLine(line)
@@ -452,13 +492,13 @@ class Liquid(object):
 		whenvar = Liquid._exprCode(whenvar, lineno, src)
 		if started:
 			self._parsePythonLiteral(
-				Liquid.TOKEN_ELIF, 
-				'{} == {}'.format(casevar, whenvar), 
+				Liquid.TOKEN_ELIF,
+				'{} == {}'.format(casevar, whenvar),
 				indent = True, dedent = True, lineno = lineno, src = src)
 		else:
 			self._parsePythonLiteral(
-				Liquid.TOKEN_IF, 
-				'{} == {}'.format(casevar, whenvar), 
+				Liquid.TOKEN_IF,
+				'{} == {}'.format(casevar, whenvar),
 				indent = True, dedent = False, lineno = lineno, src = src)
 
 	def _parseUnless(self, neattoken, lineno, src):
@@ -474,12 +514,32 @@ class Liquid(object):
 
 	def _parseDecrement(self, var, lineno, src):
 		self.code.addLine(LiquidLine('{} -= 1'.format(var), lineno = lineno, src = src))
-	
+
+	def _parseInclude(self, var, lineno, src):
+		try:
+			template_path, parameters = var.split(',')
+		except ValueError:
+			parameters = None
+			template_path = var.split()[0]
+
+		if self.include_path:
+			template_path = os.path.join(self.include_path, template_path)
+
+		with open('{}.liquid'.format(template_path.replace('\'', '').replace('\"', '')), 'r') as f:
+			code = f.read()
+			if parameters:
+				param, value = parameters.split(':')
+				self.code.addLine('{} = {}'.format(param.strip(), value.strip()))
+			runtime = Liquid(code, include_path=None)
+			for line in runtime.code.codes:
+				if not re.match(r"_liquid_.*?=.*?$", line.src) and not line.src.startswith('del'):
+					self.code.addLine(line)
+
 	def _parseComment(self, literals, sign, capture):
 		self.logger.debug(' - parsing comment: {!r}'.format(literals))
 		container = self.captured if capture else self.buffered
 		container.extend([
-			repr('{} {}'.format(sign, line.lstrip())) 
+			repr('{} {}'.format(sign, line.lstrip()))
 			for line in ''.join(literals).splitlines(True)
 		])
 
@@ -487,7 +547,7 @@ class Liquid(object):
 		self.logger.debug(' - parsing raw: {!r}'.format(literals))
 		container = self.captured if capture else self.buffered
 		container.append(repr(''.join(literals)))
-	
+
 	def _parseLiteral(self, token, capture):
 		self.logger.debug(' - parsing literal: {!r}'.format(token))
 		container = self.captured if capture else self.buffered
@@ -497,7 +557,7 @@ class Liquid(object):
 		container = self.captured if capname else self.buffered
 		if len(container) == 1:
 			self.code.addLine("{}({})".format(
-				Liquid.COMPLIED_CP_APPEND if capname else Liquid.COMPLIED_RR_APPEND, 
+				Liquid.COMPLIED_CP_APPEND if capname else Liquid.COMPLIED_RR_APPEND,
 				container[0]))
 		elif len(container) > 1:
 			self.code.addLine("{}([".format(
@@ -523,7 +583,7 @@ class Liquid(object):
 
 		try:
 			exec(str(self.code), None, localns)
-			return localns[Liquid.COMPLIED_RENDERED_STR]
+			return localns[Liquid.COMPLIED_RENDERED_STR], localns
 		except Exception:
 			stacks = list(reversed(traceback.format_exc().splitlines()))
 			for stack in stacks:
@@ -545,6 +605,6 @@ class Liquid(object):
 							source.append('  ' + (str(i+1) + '.').ljust(nbit) + str(line).rstrip())
 						else:
 							source.append('* ' + (str(i+1) + '.').ljust(nbit) + str(line).rstrip())
-					
+
 					raise LiquidRenderError(stacks[0], repr(self.code.codes[lineno - 1]) + '\n' + '\n'.join(source))
 			raise # pragma: no cover

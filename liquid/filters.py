@@ -1,5 +1,7 @@
 __all__ = ['filters']
 
+from dateutil.parser import parse
+
 def _abs(val):
 	if not isinstance(val, int) and not isinstance(val, float):
 		if val.isdigit() or (val[0] in ['+', '-'] and val[1:].isdigit()):
@@ -14,6 +16,11 @@ def _date(val, outformat, informat = None):
 		return datetime.now().strftime(outformat)
 	if val == 'today':
 		return datetime.today().strftime(outformat)
+
+	if not informat:
+		if isinstance(val, float) or isinstance(val, int):
+			return datetime.fromtimestamp(val).strftime(outformat)
+		return parse(val).strftime(outformat)
 	return datetime.strptime(val, informat).strftime(outformat)
 
 def _truncatewords(val, l, end = '...'):
@@ -60,14 +67,14 @@ filters = dict(
 	split      = _split,
 	date       = _date,
 	default    = lambda x, y: x or y,
-	divided_by = lambda x, y: x / y,
-	times      = lambda x, y: x * y,
+	divided_by = lambda x, y: float(x) / float(y),
+	times      = lambda x, y: float(x) * float(y),
 	downcase   = lambda x: str(x).lower(),
 	escape     = lambda x, quote = True: __import__('cgi').escape(x, quote),
 	floor      = lambda x: __import__('math').floor(float(x)),
 	join       = lambda x, y: y.join(x),
 	lstrip     = lambda x: str(x).lstrip(),
-	minus      = lambda x, y: x - y,
+	minus      = lambda x, y: float(x) - float(y),
 	modulo     = lambda x, y: x % y,
 	mod        = lambda x, y: x % y,
 	newline_to_br = lambda x: x.replace('\n', '<br />'),
@@ -91,5 +98,5 @@ filters = dict(
 	uniq       = lambda x: list(set(x)),
 	upcase     = lambda x: str(x).upper(),
 	url_encode = _url_encode,
-	url_decode = _url_decode
+	url_decode = _url_decode,
 )

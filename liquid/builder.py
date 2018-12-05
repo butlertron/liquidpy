@@ -63,7 +63,7 @@ class LiquidCode(object):
 		"""
 		if not isinstance(line, LiquidLine):
 			line = LiquidLine(line)
-		line.ndent = self.ndent
+		line.ndent += self.ndent
 		self.codes.append(line)
 	
 	def indent(self):
